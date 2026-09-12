@@ -1,3 +1,5 @@
+#include "ksu_samsung_kdp.h"
+#include "compat/samsung_defex.h"
 #include "selinux.h"
 #include "linux/cred.h"
 #include "linux/sched.h"
@@ -224,5 +226,10 @@ void escape_to_root_for_adb_root(void)
         abort_creds(cred);
         return;
     }
-    commit_creds(cred);
+    if (ksu_samsung_kdp_commit_creds(cred)) {
+        pr_err("Samsung KDP credential install failed in escape_to_root_for_adb_root\n");
+        abort_creds(cred);
+        return;
+    }
+    ksu_samsung_defex_sync_current();
 }

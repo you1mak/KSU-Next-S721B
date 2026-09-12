@@ -36,8 +36,12 @@ fn dump_process_info(label: &str) {
 }
 
 pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {
-    utils::daemonize(false)?;
     info!("late-load command triggered!");
+
+    // Stage the daemon while the process still has access to its current context.
+    // The protected final path is installed only after KernelSU has been loaded.
+    utils::stage_daemon_to("/data/local/tmp/.ksud-stage")
+        .context("Failed to stage ksud for late-load")?;
     dump_process_info("late-load start");
 
     // 1. Check if KernelSU is already loaded
@@ -79,7 +83,9 @@ pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Res
         warn!("clear temp configs failed: {e}");
     }
 
-    utils::install(None).context("Failed to install ksud")?;
+        utils::stage_daemon_from("/data/local/tmp/.ksud-stage")
+        .context("Failed to install staged ksud")?;
+    utils::finish_install(None).context("Failed to finish ksud installation")?;
 
     // 5. Handle module updates
     if let Err(e) = handle_updated_modules() {

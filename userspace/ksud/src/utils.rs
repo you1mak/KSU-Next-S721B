@@ -3,7 +3,7 @@ use rustix::fs::{Mode, OFlags, open};
 use rustix::process::setpgid;
 use rustix::stdio::{dup2_stderr, dup2_stdin, dup2_stdout};
 use std::{
-    ffi::{CStr, CString, c_char, c_void},
+    ffi::{CStr, CString},
     fs::{File, OpenOptions, create_dir_all, remove_file, write},
     io::{
         ErrorKind::{AlreadyExists, NotFound},
@@ -28,16 +28,7 @@ use rustix::{
     thread::{LinkNameSpaceType, move_into_link_name_space},
 };
 
-type PropertyReadCallback = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, u32);
-
-unsafe extern "C" {
-    fn __system_property_find(name: *const c_char) -> *const c_void;
-    fn __system_property_read_callback(
-        property_info: *const c_void,
-        callback: PropertyReadCallback,
-        cookie: *mut c_void,
-    );
-}
+// Removida a importação problemática de prop_rs_android::Property
 
 #[macro_export]
 macro_rules! debug_select {
@@ -115,37 +106,24 @@ pub fn ensure_binary<T: AsRef<Path>>(
     Ok(())
 }
 
-unsafe extern "C" fn property_read_callback(
-    cookie: *mut c_void,
-    _name: *const c_char,
-    value: *const c_char,
-    _serial: u32,
-) {
-    if cookie.is_null() || value.is_null() {
-        return;
-    }
-
-    let result = unsafe { &mut *cookie.cast::<Option<String>>() };
-    let value = unsafe { CStr::from_ptr(value) };
-    *result = Some(value.to_string_lossy().into_owned());
-}
-
+// ----------------------------------------------------------------------
+// Função getprop reescrita usando __system_property_get (API pública)
+// ----------------------------------------------------------------------
 pub fn getprop(name: &str) -> Option<String> {
-    let name = CString::new(name).ok()?;
-    let property_info = unsafe { __system_property_find(name.as_ptr()) };
-    if property_info.is_null() {
-        return None;
+    let name_cstr = CString::new(name).ok()?;
+    let mut buf = [0u8; 92]; // PROP_VALUE_MAX = 92
+    let len = unsafe {
+        libc::__system_property_get(
+            name_cstr.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+        )
+    };
+    if len > 0 {
+        let value = CStr::from_bytes_until_nul(&buf[..len as usize]).ok()?;
+        Some(value.to_string_lossy().into_owned())
+    } else {
+        None
     }
-
-    let mut value = None;
-    unsafe {
-        __system_property_read_callback(
-            property_info,
-            property_read_callback,
-            std::ptr::addr_of_mut!(value).cast(),
-        );
-    }
-    value
 }
 
 pub fn is_safe_mode() -> bool {
@@ -230,13 +208,43 @@ fn link_ksud_to_bin() -> Result<()> {
     Ok(())
 }
 
-pub fn install(libadbroot: Option<PathBuf>) -> Result<()> {
+// ---- Novas funções adicionadas ----
+pub fn stage_daemon_to(staged_exe: impl AsRef<Path>) -> Result<()> {
+    let staged_exe = staged_exe.as_ref();
+    if let Some(parent) = staged_exe.parent() {
+        ensure_dir_exists(parent)?;
+    }
+
+    let current_exe = std::env::current_exe().with_context(|| "Failed to get self exe path")?;
+    let daemon = std::fs::read(&current_exe)
+        .with_context(|| format!("Failed to read {}", current_exe.display()))?;
+    std::fs::write(staged_exe, daemon)
+        .with_context(|| format!("Failed to write {}", staged_exe.display()))?;
+    #[cfg(unix)]
+    set_permissions(staged_exe, Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+pub fn stage_daemon() -> Result<()> {
     ensure_dir_exists(defs::ADB_DIR)?;
-    let _ = std::fs::remove_file(defs::DAEMON_PATH);
-    std::fs::copy(
-        std::env::current_exe().with_context(|| "Failed to get self exe path")?,
-        defs::DAEMON_PATH,
-    )?;
+    stage_daemon_to(defs::DAEMON_PATH)
+}
+
+pub fn stage_daemon_from(staged_exe: impl AsRef<Path>) -> Result<()> {
+    ensure_dir_exists(defs::ADB_DIR)?;
+    std::fs::rename(staged_exe.as_ref(), defs::DAEMON_PATH).with_context(|| {
+        format!(
+            "Failed to rename {} to {}",
+            staged_exe.as_ref().display(),
+            defs::DAEMON_PATH
+        )
+    })?;
+    #[cfg(unix)]
+    set_permissions(defs::DAEMON_PATH, Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+pub fn finish_install(libadbroot: Option<PathBuf>) -> Result<()> {
     restorecon::lsetfilecon(defs::DAEMON_PATH, restorecon::KSU_CON)?;
     // install binary assets
     assets::ensure_binaries(false).with_context(|| "Failed to extract assets")?;
@@ -251,6 +259,13 @@ pub fn install(libadbroot: Option<PathBuf>) -> Result<()> {
 
     Ok(())
 }
+
+// ---- Função install modificada ----
+pub fn install(libadbroot: Option<PathBuf>) -> Result<()> {
+    stage_daemon()?;
+    finish_install(libadbroot)
+}
+// ---- Fim das modificações ----
 
 pub fn uninstall(package_name: &str) -> Result<()> {
     if Path::new(defs::MODULE_DIR).exists() {

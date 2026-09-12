@@ -105,6 +105,26 @@ fail:
 #define ksu_flush_icache(start, end) __flush_icache_range
 #endif
 
+#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
+/*
+ * Samsung RKP (Exynos): set_fixmap_offset() creates a writable PTE for a
+ * protected physical page -> EL2 exception -> WDT reset.
+ * Samsung kernels keep these mappings writable at EL1, so write directly
+ * to the target virtual address (same approach as Root My Galaxy).
+ */
+int ksu_patch_text(void *dst, void *src, size_t len, int flags)
+{
+    int ret = (int)copy_to_kernel_nofault(dst, src, len);
+
+    if (!ret) {
+        if (flags & KSU_PATCH_TEXT_FLUSH_ICACHE)
+            ksu_flush_icache((uintptr_t)dst, (uintptr_t)dst + len);
+        if (flags & KSU_PATCH_TEXT_FLUSH_DCACHE)
+            ksu_flush_dcache(dst, len);
+    }
+    return ret;
+}
+#else
 struct patch_text_info {
     void *dst;
     void *src;
@@ -202,6 +222,7 @@ int ksu_patch_text(void *dst, void *src, size_t len, int flags)
 
     return stop_machine(ksu_patch_text_cb, &info, cpu_online_mask);
 }
+#endif /* CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT */
 
 /*
  * Scan the memory region [start, start+size) for a BL instruction whose
